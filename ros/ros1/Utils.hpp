@@ -57,12 +57,15 @@ inline auto GetTimestampField(const PointCloud2::ConstPtr msg) {
 
 // Normalize timestamps from 0.0 to 1.0
 inline auto NormalizeTimestamps(const std::vector<double> &timestamps) {
-    const double max_timestamp = *std::max_element(timestamps.cbegin(), timestamps.cend());
-    // check if already normalized
-    if (max_timestamp < 1.0) return timestamps;
+    const auto [min_it, max_it] = std::minmax_element(timestamps.cbegin(), timestamps.cend());
+    const double min_timestamp = *min_it;
+    const double max_timestamp = *max_it;
+
     std::vector<double> timestamps_normalized(timestamps.size());
     std::transform(timestamps.cbegin(), timestamps.cend(), timestamps_normalized.begin(),
-                   [&](const auto &timestamp) { return timestamp / max_timestamp; });
+                   [&](const auto &timestamp) {
+                       return (timestamp - min_timestamp) / (max_timestamp - min_timestamp);
+                   });
     return timestamps_normalized;
 }
 
@@ -109,7 +112,7 @@ inline std::unique_ptr<PointCloud2> CreatePointCloud2Msg(const size_t n_points,
     offset = addPointField(*cloud_msg, "z", 1, PointField::FLOAT32, offset);
     offset += sizeOfPointField(PointField::FLOAT32);
     if (timestamp) {
-        // asuming timestamp on a velodyne fashion for now (between 0.0 and 1.0)
+        // assuming timestamp on a velodyne fashion for now (between 0.0 and 1.0)
         offset = addPointField(*cloud_msg, "time", 1, PointField::FLOAT64, offset);
         offset += sizeOfPointField(PointField::FLOAT64);
     }
