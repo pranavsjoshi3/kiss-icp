@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <numeric>
 #include <sophus/se3.hpp>
 #include <sophus/so3.hpp>
@@ -41,8 +42,10 @@ using Matrix6d = Eigen::Matrix<double, 6, 6>;
 using Matrix3_6d = Eigen::Matrix<double, 3, 6>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
 }  // namespace Eigen
-using Associations = std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>>;
-using LinearSystem = std::pair<Eigen::Matrix6d, Eigen::Vector6d>;
+
+using Correspondence = std::pair<Eigen::Vector3d, Eigen::Vector3d>;
+using Associations = std::vector<Correspondence>;
+using LinearSystem = std::tuple<Eigen::Matrix6d, Eigen::Vector6d, double>;
 
 namespace {
 inline double square(double x) { return x * x; }
@@ -120,7 +123,7 @@ Associations FindAssociations(const std::vector<Eigen::Vector3d> &points,
     return associations;
 }
 
-LinearSystem BuildLinearSystem(const Associations &associations, double kernel) {
+LinearSystem BuildLinearSystem(const Associations &associations, const double kernel_threshold) {
     auto compute_jacobian_and_residual = [](auto association) {
         const auto &[source, target] = association;
         const Eigen::Vector3d residual = source - target;
@@ -131,37 +134,59 @@ LinearSystem BuildLinearSystem(const Associations &associations, double kernel) 
     };
 
     auto sum_linear_systems = [](LinearSystem a, const LinearSystem &b) {
-        a.first += b.first;
-        a.second += b.second;
+        std::get<Eigen::Matrix6d>(a) += std::get<Eigen::Matrix6d>(b);
+        std::get<Eigen::Vector6d>(a) += std::get<Eigen::Vector6d>(b);
+        std::get<double>(a) += std::get<double>(b);
         return a;
     };
 
-    auto GM_weight = [&](double residual2) { return square(kernel) / square(kernel + residual2); };
+    auto GM_kernel = [&](double residual2) {
+        return square(kernel_threshold) / square(kernel_threshold + residual2);
+    };
 
     using associations_iterator = Associations::const_iterator;
-    const auto &[JTJ, JTr] = tbb::parallel_reduce(
+    const auto &[JTJ, JTr, chi_square] = tbb::parallel_reduce(
         // Range
         tbb::blocked_range<associations_iterator>{associations.cbegin(), associations.cend()},
         // Identity
-        LinearSystem(Eigen::Matrix6d::Zero(), Eigen::Vector6d::Zero()),
+        LinearSystem(Eigen::Matrix6d::Zero(), Eigen::Vector6d::Zero(), 0.0),
         // 1st Lambda: Parallel computation
         [&](const tbb::blocked_range<associations_iterator> &r, LinearSystem J) -> LinearSystem {
             return std::transform_reduce(
                 r.begin(), r.end(), J, sum_linear_systems, [&](const auto &association) {
                     const auto &[J_r, residual] = compute_jacobian_and_residual(association);
-                    const double w = GM_weight(residual.squaredNorm());
-                    return LinearSystem(J_r.transpose() * w * J_r,        // JTJ
-                                        J_r.transpose() * w * residual);  // JTr
+                    const double chi_square = residual.squaredNorm();
+                    const double w = GM_kernel(chi_square);
+                    return LinearSystem(J_r.transpose() * w * J_r,       // JTJ
+                                        J_r.transpose() * w * residual,  // JTr
+                                        chi_square);
                 });
         },
         // 2nd Lambda: Parallel reduction of the private Jacboians
         sum_linear_systems);
 
-    return {JTJ, JTr};
+    return {JTJ, JTr, chi_square};
 }
 }  // namespace
 
 namespace kiss_icp {
+
+Estimate::Estimate() : pose(), covariance(Eigen::Matrix6d::Zero()) {}
+Estimate::Estimate(const Sophus::SE3d &T, const Eigen::Matrix6d &Sigma)
+    : pose(T), covariance(Sigma) {}
+
+// Equations from figure 3 of https://arxiv.org/pdf/1906.07795.pdf
+Estimate Estimate::inverse() const {
+    const auto Adj = pose.inverse().Adj();
+    return {pose.inverse(), Adj * covariance * Adj.transpose()};
+}
+
+Estimate operator*(Estimate lhs, const Estimate &rhs) {
+    lhs.pose *= rhs.pose;
+    const auto Adj = lhs.pose.Adj();
+    lhs.covariance += Adj * rhs.covariance * Adj.transpose();
+    return lhs;
+}
 
 Registration::Registration(int max_num_iteration, double convergence_criterion, int max_num_threads)
     : max_num_iterations_(max_num_iteration),
@@ -174,35 +199,38 @@ Registration::Registration(int max_num_iteration, double convergence_criterion, 
         tbb::global_control::max_allowed_parallelism, static_cast<size_t>(max_num_threads_));
 }
 
-Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &frame,
-                                            const VoxelHashMap &voxel_map,
-                                            const Sophus::SE3d &initial_guess,
-                                            double max_correspondence_distance,
-                                            double kernel) {
+Estimate Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &frame,
+                                        const VoxelHashMap &voxel_map,
+                                        const Estimate &initial_guess,
+                                        double max_correspondence_distance,
+                                        double kernel_threshold) {
     if (voxel_map.Empty()) return initial_guess;
 
     // Equation (9)
     std::vector<Eigen::Vector3d> source = frame;
-    TransformPoints(initial_guess, source);
+    TransformPoints(initial_guess.pose, source);
 
     // ICP-loop
-    Sophus::SE3d T_icp = Sophus::SE3d();
+    Estimate icp_correction;
     for (int j = 0; j < max_num_iterations_; ++j) {
         // Equation (10)
-        const auto associations = FindAssociations(source, voxel_map, max_correspondence_distance);
+        const auto &associations = FindAssociations(source, voxel_map, max_correspondence_distance);
         // Equation (11)
-        const auto &[JTJ, JTr] = BuildLinearSystem(associations, kernel);
-        const Eigen::Vector6d dx = JTJ.ldlt().solve(-JTr);
+        const auto &[JTJ, JTr, chi_square] = BuildLinearSystem(associations, kernel_threshold);
+        const auto JTJ_inverse = JTJ.inverse();
+        const Eigen::Vector6d dx = -JTJ_inverse * JTr;
         const Sophus::SE3d estimation = Sophus::SE3d::exp(dx);
+        icp_correction.pose = estimation * icp_correction.pose;
+        // Follow Ollila et.al. https://arxiv.org/pdf/2006.10005.pdf - Eq. (2) for sample covariance
+        // using an M estimator
+        icp_correction.covariance = 1.0 / static_cast<double>(associations.size()) * JTJ_inverse;
         // Equation (12)
         TransformPoints(estimation, source);
-        // Update iterations
-        T_icp = estimation * T_icp;
         // Termination criteria
         if (dx.norm() < convergence_criterion_) break;
     }
     // Spit the final transformation
-    return T_icp * initial_guess;
+    return icp_correction * initial_guess;
 }
 
 }  // namespace kiss_icp

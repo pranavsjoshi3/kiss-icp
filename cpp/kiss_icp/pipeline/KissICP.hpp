@@ -71,17 +71,17 @@ public:
                                       const std::vector<double> &timestamps);
     Vector3dVectorTuple Voxelize(const std::vector<Eigen::Vector3d> &frame) const;
     double GetAdaptiveThreshold();
-    Sophus::SE3d GetPredictionModel() const;
+    Estimate GetPredictionModel() const;
     bool HasMoved();
 
 public:
     // Extra C++ API to facilitate ROS debugging
     std::vector<Eigen::Vector3d> LocalMap() const { return local_map_.Pointcloud(); };
-    std::vector<Sophus::SE3d> poses() const { return poses_; };
+    std::vector<Estimate> estimates() const { return estimates_; };
 
 private:
     // KISS-ICP pipeline modules
-    std::vector<Sophus::SE3d> poses_;
+    std::vector<Estimate> estimates_;
     KISSConfig config_;
     Registration registration_;
     VoxelHashMap local_map_;

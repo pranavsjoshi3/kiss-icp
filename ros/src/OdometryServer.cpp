@@ -29,6 +29,7 @@
 // KISS-ICP-ROS
 #include "OdometryServer.hpp"
 #include "Utils.hpp"
+#include "kiss_icp/core/Registration.hpp"
 
 // KISS-ICP
 #include "kiss_icp/pipeline/KissICP.hpp"
@@ -77,8 +78,6 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     odom_frame_ = declare_parameter<std::string>("odom_frame", odom_frame_);
     publish_odom_tf_ = declare_parameter<bool>("publish_odom_tf", publish_odom_tf_);
     publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", publish_debug_clouds_);
-    position_covariance_ = declare_parameter<double>("position_covariance", 0.1);
-    orientation_covariance_ = declare_parameter<double>("orientation_covariance", 0.1);
 
     kiss_icp::pipeline::KISSConfig config;
     config.max_range = declare_parameter<double>("max_range", config.max_range);
@@ -136,35 +135,34 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     // Register frame, main entry point to KISS-ICP pipeline
     const auto &[frame, keypoints] = kiss_icp_->RegisterFrame(points, timestamps);
 
-    // Extract the last KISS-ICP pose, ego-centric to the LiDAR
-    const Sophus::SE3d kiss_pose = kiss_icp_->poses().back();
+    // Compute the pose using KISS, ego-centric to the LiDAR
+    const auto kiss_estimate = kiss_icp_->estimates().back();
 
-    // Spit the current estimated pose to ROS msgs handling the desired target frame
-    PublishOdometry(kiss_pose, msg->header);
-    // Publishing these clouds is a bit costly, so do it only if we are debugging
+    // Spit the current estimated pose to ROS msgs
+    PublishOdometry(kiss_estimate, msg->header);
+    // Publishing this clouds is a bit costly, so do it only if we are debugging
     if (publish_debug_clouds_) {
         PublishClouds(frame, keypoints, msg->header);
     }
 }
-
-void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
+void OdometryServer::PublishOdometry(const kiss_icp::Estimate &kiss_estimate,
                                      const std_msgs::msg::Header &header) {
     // If necessary, transform the ego-centric pose to the specified base_link/base_footprint frame
     const auto cloud_frame_id = header.frame_id;
     const auto egocentric_estimation = (base_frame_.empty() || base_frame_ == cloud_frame_id);
-    const auto pose = [&]() -> Sophus::SE3d {
-        if (egocentric_estimation) return kiss_pose;
-        const Sophus::SE3d cloud2base = LookupTransform(base_frame_, cloud_frame_id, tf2_buffer_);
-        return cloud2base * kiss_pose * cloud2base.inverse();
+    const auto estimate = [&]() -> kiss_icp::Estimate {
+        if (egocentric_estimation) return kiss_estimate;
+        kiss_icp::Estimate cloud2base;
+        cloud2base.pose = LookupTransform(base_frame_, cloud_frame_id, tf2_buffer_);
+        return cloud2base * kiss_estimate * cloud2base.inverse();
     }();
-
     // Broadcast the tf ---
     if (publish_odom_tf_) {
         geometry_msgs::msg::TransformStamped transform_msg;
         transform_msg.header.stamp = header.stamp;
         transform_msg.header.frame_id = odom_frame_;
-        transform_msg.child_frame_id = egocentric_estimation ? cloud_frame_id : base_frame_;
-        transform_msg.transform = tf2::sophusToTransform(pose);
+        transform_msg.child_frame_id = base_frame_.empty() ? cloud_frame_id : base_frame_;
+        transform_msg.transform = tf2::sophusToTransform(estimate.pose);
         tf_broadcaster_->sendTransform(transform_msg);
     }
 
@@ -172,14 +170,13 @@ void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
     nav_msgs::msg::Odometry odom_msg;
     odom_msg.header.stamp = header.stamp;
     odom_msg.header.frame_id = odom_frame_;
-    odom_msg.pose.pose = tf2::sophusToPose(pose);
+    odom_msg.pose.pose = tf2::sophusToPose(estimate.pose);
     odom_msg.pose.covariance.fill(0.0);
-    odom_msg.pose.covariance[0] = position_covariance_;
-    odom_msg.pose.covariance[7] = position_covariance_;
-    odom_msg.pose.covariance[14] = position_covariance_;
-    odom_msg.pose.covariance[21] = orientation_covariance_;
-    odom_msg.pose.covariance[28] = orientation_covariance_;
-    odom_msg.pose.covariance[35] = orientation_covariance_;
+    for (int r = 0; r < 6; ++r) {
+        for (int c = 0; c < 6; ++c) {
+            odom_msg.pose.covariance[r * 6 + c] = estimate.covariance(r, c);
+        }
+    }
     odom_publisher_->publish(std::move(odom_msg));
 }
 
@@ -187,7 +184,7 @@ void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> frame,
                                    const std::vector<Eigen::Vector3d> keypoints,
                                    const std_msgs::msg::Header &header) {
     const auto kiss_map = kiss_icp_->LocalMap();
-    const auto kiss_pose = kiss_icp_->poses().back().inverse();
+    const auto kiss_pose = kiss_icp_->estimates().back().pose.inverse();
 
     frame_publisher_->publish(std::move(EigenToPointCloud2(frame, header)));
     kpoints_publisher_->publish(std::move(EigenToPointCloud2(keypoints, header)));

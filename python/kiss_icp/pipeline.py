@@ -65,7 +65,9 @@ class OdometryPipeline:
         self.odometry = KissICP(config=self.config)
         self.results = PipelineResults()
         self.times = []
-        self.poses = self.odometry.poses
+        self.estimates = self.odometry.estimates
+        self.poses = []
+        self.covariances = []
         self.has_gt = hasattr(self._dataset, "gt_poses")
         self.gt_poses = self._dataset.gt_poses[self._first : self._last] if self.has_gt else None
         self.dataset_name = self._dataset.__class__.__name__
@@ -89,6 +91,7 @@ class OdometryPipeline:
         self._write_gt_poses()
         self._write_cfg()
         self._write_log()
+        self._write_covariances()
         return self.results
 
     # Private interface  ------
@@ -97,8 +100,12 @@ class OdometryPipeline:
             raw_frame, timestamps = self._next(idx)
             start_time = time.perf_counter_ns()
             source, keypoints = self.odometry.register_frame(raw_frame, timestamps)
+            self.poses.append(self.estimates[-1].pose)
+            self.covariances.append(self.estimates[-1].covariance)
             self.times.append(time.perf_counter_ns() - start_time)
-            self.visualizer.update(source, keypoints, self.odometry.local_map, self.poses[-1])
+            self.visualizer.update(
+                source, keypoints, self.odometry.local_map, self.estimates[-1].pose
+            )
 
     def _next(self, idx):
         """TODO: re-arrange this logic"""
@@ -164,6 +171,9 @@ class OdometryPipeline:
             poses=self._calibrate_poses(self.gt_poses),
             timestamps=self._get_frames_timestamps(),
         )
+
+    def _write_covariances(self):
+        np.save(f"{self.results_dir}/covariances.npy", np.stack(self.covariances))
 
     def _run_evaluation(self):
         # Run estimation metrics evaluation, only when GT data was provided

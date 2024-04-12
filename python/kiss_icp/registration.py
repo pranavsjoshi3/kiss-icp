@@ -20,6 +20,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+from typing import TypeAlias
+
 import numpy as np
 
 from kiss_icp.config.parser import KISSConfig
@@ -33,6 +35,10 @@ def get_registration(config: KISSConfig):
         convergence_criterion=config.registration.convergence_criterion,
         max_num_threads=config.registration.max_num_threads,
     )
+
+
+# Nice trick with the type aliasing for structs
+Estimate: TypeAlias = kiss_icp_pybind._Estimate
 
 
 class Registration:
