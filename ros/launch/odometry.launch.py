@@ -37,12 +37,12 @@ from launch_ros.substitutions import FindPackageShare
 # launch file and modify the 'parameters=' block from the Node class.
 class config:
     # Preprocessing
-    max_range: float = 100.0
-    min_range: float = 5.0
+    max_range: float = 75.0
+    min_range: float = 1.0
     deskew: bool = False
 
     #  Mapping parameters
-    voxel_size: float = max_range / 100.0
+    voxel_size: float = 0.4
     max_points_per_voxel: int = 20
 
     # Adaptive threshold
@@ -117,7 +117,9 @@ def generate_launch_description():
         output="screen",
         arguments=[
             "-d",
-            PathJoinSubstitution([FindPackageShare("kiss_icp"), "rviz", "kiss_icp.rviz"]),
+            PathJoinSubstitution(
+                [FindPackageShare("kiss_icp"), "rviz", "kiss_icp.rviz"]
+            ),
         ],
         condition=IfCondition(visualize),
     )
